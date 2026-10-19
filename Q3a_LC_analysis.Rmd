@@ -1,0 +1,394 @@
+---
+title: "ACTL90007 Assignment 2 — Q3: LC and cohort models"
+subtitle: "Total population; ages 40–90; years 1961–2005"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    self_contained: true
+params:
+  data_dir: "data"
+---
+
+```{r setup, include=FALSE}
+required <- c("StMoMo", "reshape2", "knitr", "rmarkdown", "fields")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)]
+if (length(missing)) stop(
+  "Install missing packages in the Console before Knit: install.packages(c(",
+  paste(sprintf('"%s"', missing), collapse=", "), "))"
+)
+suppressPackageStartupMessages(library(StMoMo))
+suppressPackageStartupMessages(library(reshape2))
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=TRUE,
+                     fig.width=11, fig.height=5.5, dpi=150, cache=FALSE)
+set.seed(90007)
+ages.fit <- 40:90
+years.fit <- 1961:2005
+country_names <- c(AUS="Australia", UK="United Kingdom")
+data_dir <- path.expand(params$data_dir)
+fmt <- function(x, digits=3) formatC(x, digits=digits, format="f", big.mark=",")
+```
+
+# Scope, data paths and the teaching script
+
+This document completes **Q3(a) and Q3(b)**. Its filename is retained as requested.
+It uses the lecturer's `StMoMo` Poisson LC and Renshaw–Haberman (RH) methods.
+All estimates, tables, plotted values and numerical conclusions below are calculated
+when this document is knitted; no previous fitted objects or results are loaded.
+
+Keep the four supplied TXT files in the `data` folder beside this Rmd. RStudio's
+Knit command uses the Rmd folder as its default working directory. This document
+uses relative paths, not `file.choose()` or a guessed desktop path. If needed, edit
+`params: data_dir:` above to the actual data folder. Missing files cause an explicit
+error before any model is fitted.
+
+The teaching example uses Male, ages 20–89 and years 1981–2021. These are changed
+to **Total, ages 40–90 and years 1961–2005**. Forecasting blocks and age-50 forecast
+comparisons are omitted because Q3 does not request them. The original script's
+late references to the undefined `RH.simple.fit` would cause errors: the Q3(b)
+implementation below consistently uses the actual object `RH.fit`. RH-related
+code is retained only for part (b), not for the LC analysis in part (a).
+
+## Read and verify the original text files
+
+```{r file-input}
+files <- data.frame(
+  country=c("AUS", "AUS", "UK", "UK"),
+  kind=c("Deaths", "Exposures", "Deaths", "Exposures"),
+  filename=c("AUS_Deaths_1x1.txt", "AUS_Exposures_1x1.txt",
+             "UK_Deaths_1x1.txt", "UK_Exposures_1x1.txt"),
+  stringsAsFactors=FALSE
+)
+files$path <- file.path(data_dir, files$filename)
+if (any(!file.exists(files$path))) {
+  stop("Missing data files: ", paste(files$path[!file.exists(files$path)], collapse=", "),
+       ". Keep the data folder beside this Rmd; current directory is ", getwd())
+}
+
+read_hmd <- function(path, country, kind) {
+  first_lines <- readLines(path, n=10, warn=FALSE)
+  expected_country <- unname(country_names[country])
+  if (!startsWith(first_lines[1], paste0(expected_country, ",")))
+    stop("Country mismatch in ", path, ": ", first_lines[1])
+  expected_kind <- if (kind=="Deaths") "Deaths" else "Exposure"
+  if (!grepl(expected_kind, first_lines[1], fixed=TRUE))
+    stop("Deaths/exposures file mismatch: ", path)
+  header_row <- grep("^\\s*Year\\s+Age\\s+", first_lines)
+  if (length(header_row)!=1L) stop("Cannot locate unique Year/Age header: ", path)
+  # For all four inspected files header_row=3, hence skip=2.
+  # Detecting it also protects against different numbers of description lines.
+  raw <- read.table(path, skip=header_row-1L, header=TRUE,
+                    stringsAsFactors=FALSE, na.strings=".")
+  required_columns <- c("Year", "Age", "Female", "Male", "Total")
+  if (!all(required_columns %in% names(raw)))
+    stop("Unexpected file columns in ", path)
+  raw$Age_num <- as.numeric(gsub("\\+", "", as.character(raw$Age)))
+  list(raw=raw, header=first_lines[1], skipped=header_row-1L)
+}
+
+loaded <- lapply(seq_len(nrow(files)), function(i)
+  read_hmd(files$path[i], files$country[i], files$kind[i]))
+files$description <- vapply(loaded, `[[`, character(1), "header")
+files$lines_skipped <- vapply(loaded, `[[`, integer(1), "skipped")
+knitr::kable(files[c("filename", "lines_skipped", "description")],
+             caption="Actual filenames and country/type checks from the file headers")
+```
+
+## Construct age-by-year matrices and check the data
+
+```{r matrices-and-checks}
+make_population <- function(country) {
+  death_i <- which(files$country==country & files$kind=="Deaths")
+  exposure_i <- which(files$country==country & files$kind=="Exposures")
+  d <- loaded[[death_i]]$raw
+  e <- loaded[[exposure_i]]$raw
+  d <- subset(d, Year %in% years.fit & Age_num %in% ages.fit)
+  e <- subset(e, Year %in% years.fit & Age_num %in% ages.fit)
+  expected_n <- length(ages.fit)*length(years.fit)
+  if (nrow(d)!=expected_n || nrow(e)!=expected_n ||
+      anyDuplicated(d[c("Age_num", "Year")]) ||
+      anyDuplicated(e[c("Age_num", "Year")]))
+    stop("Incomplete or duplicate age/year grid for ", country)
+  # IMPORTANT: Total (both sexes); rows=age and columns=calendar year.
+  Dxt <- acast(d, Age_num ~ Year, value.var="Total")
+  Ext <- acast(e, Age_num ~ Year, value.var="Total")
+  Dxt <- as.matrix(Dxt[as.character(ages.fit), as.character(years.fit)])
+  Ext <- as.matrix(Ext[as.character(ages.fit), as.character(years.fit)])
+  stopifnot(identical(dim(Dxt), c(51L,45L)), identical(dim(Ext), c(51L,45L)),
+            identical(rownames(Dxt), as.character(ages.fit)),
+            identical(colnames(Dxt), as.character(years.fit)),
+            identical(dimnames(Dxt), dimnames(Ext)))
+  if (any(!is.finite(Dxt)) || any(!is.finite(Ext)) ||
+      any(Dxt<0) || any(Ext<=0)) stop("Invalid selected data: ", country)
+  list(Dxt=Dxt, Ext=Ext)
+}
+populations <- lapply(names(country_names), make_population)
+names(populations) <- names(country_names)
+
+checks <- do.call(rbind, lapply(names(populations), function(country) {
+  z <- populations[[country]]
+  data.frame(Country=country_names[country],
+    Dxt_rows=nrow(z$Dxt), Dxt_columns=ncol(z$Dxt),
+    Ext_rows=nrow(z$Ext), Ext_columns=ncol(z$Ext),
+    Age_range=paste(range(as.integer(rownames(z$Dxt))),collapse="–"),
+    Year_range=paste(range(as.integer(colnames(z$Dxt))),collapse="–"),
+    Missing_D=sum(is.na(z$Dxt)), Missing_E=sum(is.na(z$Ext)),
+    Negative_D=sum(z$Dxt<0), Nonpositive_E=sum(z$Ext<=0),
+    Zero_D=sum(z$Dxt==0),
+    Nonfinite_log_rates=sum(!is.finite(log(z$Dxt/z$Ext))),row.names=NULL)
+}))
+knitr::kable(checks, caption="Checks on the selected 51-by-45 grids")
+stopifnot(all(checks$Nonfinite_log_rates==0))
+```
+
+Each matrix has **`r nrow(populations$AUS$Dxt)` age rows** and
+**`r ncol(populations$AUS$Dxt)` year columns**, or
+**`r length(populations$AUS$Dxt)` cells**. The table reports missing and invalid
+observations explicitly. No ages or years are silently dropped, no missing rates
+are imputed, and the provided HMD death values are not rounded.
+
+# Q3(a): Lee–Carter models
+
+For each population the model is
+\[
+D_{x,t}\sim\operatorname{Poisson}(E^c_{x,t}m_{x,t}),\qquad
+\log m_{x,t}=a_x+b_xk_t.
+\]
+Here $a_x$ describes the baseline age pattern of log mortality; $k_t$ is the common
+period index; and $b_x$ measures the sensitivity of log mortality at age $x$ to
+changes in that index. The usual LC constraints $\sum_xb_x=1$ and
+$\sum_tk_t=0$ identify the scale and location. Deaths and exposures are supplied
+directly to `StMoMo::fit`, following the teacher's example.
+
+```{r fit-lc}
+LC <- lc(link="log")
+LC.fits <- lapply(populations, function(z)
+  fit(LC, Dxt=z$Dxt, Ext=z$Ext, ages=ages.fit, years=years.fit, verbose=FALSE))
+if (!all(vapply(LC.fits, function(f) isTRUE(f$conv), logical(1))))
+  stop("At least one LC model did not converge; do not interpret it as a completed fit.")
+fit_checks <- do.call(rbind, lapply(names(LC.fits), function(country) {
+  f <- LC.fits[[country]]
+  data.frame(Country=country_names[country], Converged=f$conv,
+             Cells=f$nobs, Parameters=f$npar, Poisson_deviance=f$deviance,
+             Sum_bx=sum(f$bx[,1]), Sum_kt=sum(f$kt),row.names=NULL)
+}))
+knitr::kable(fit_checks, digits=6,caption="LC fitting results calculated during Knit")
+```
+
+## Estimated parameters
+
+```{r lc-parameters, fig.height=7, fig.cap="Estimated LC parameters. Common axis limits are used within each parameter column."}
+par(mfrow=c(2,3), mar=c(4,4,3,1))
+for (country in names(LC.fits)) {
+  f <- LC.fits[[country]]
+  label <- country_names[country]
+  plot(ages.fit, f$ax, type="l", col="#17365D", xlab="Age x", ylab=expression(a[x]),
+       main=paste(label, "LC: age effect"),
+       ylim=range(unlist(lapply(LC.fits, `[[`, "ax"))))
+  plot(ages.fit, f$bx[,1], type="l", col="#17365D", xlab="Age x", ylab=expression(b[x]),
+       main=paste(label, "LC: age sensitivity"),
+       ylim=range(unlist(lapply(LC.fits, `[[`, "bx"))))
+  plot(years.fit, f$kt[1,], type="l", col="#17365D", xlab="Calendar year t", ylab=expression(k[t]),
+       main=paste(label, "LC: period index"),
+       ylim=range(unlist(lapply(LC.fits, `[[`, "kt"))))
+}
+```
+
+```{r parameter-comments, results='asis', echo=FALSE}
+for (country in names(LC.fits)) {
+  f <- LC.fits[[country]]
+  peak <- ages.fit[which.max(f$bx[,1])]
+  cat(sprintf("**%s.** The estimated age effect rises from %.3f at age 40 to %.3f at age 90, consistent with higher mortality at older ages. The largest estimated age sensitivity occurs at age %d. The period index changes from %.2f in 1961 to %.2f in 2005.\n\n",
+      country_names[country], f$ax[1], tail(f$ax,1), peak, f$kt[1,1], tail(f$kt[1,],1)))
+}
+positive_b <- all(vapply(LC.fits, function(f) all(f$bx[,1]>0), logical(1)))
+decreasing_k <- all(vapply(LC.fits, function(f) tail(f$kt[1,],1)<f$kt[1,1], logical(1)))
+if (positive_b && decreasing_k)
+  cat("Both countries have positive age sensitivities and an overall decline in the period index, indicating broad mortality improvement. The plots show fluctuations rather than an exactly monotone trend. The sensitivity curves peak in middle age and are lower at the oldest ages. Parameter magnitudes are model-specific; a cross-country difference in k_t is not itself a mortality-rate difference.\n")
+```
+
+## Age–year residual maps and cohort evidence
+
+The unscaled Poisson deviance residual is
+\[
+r_{x,t}=\operatorname{sign}(D_{x,t}-\hat D_{x,t})
+\sqrt{2\left[D_{x,t}\log\left(\frac{D_{x,t}}{\hat D_{x,t}}\right)
+-(D_{x,t}-\hat D_{x,t})\right]},\qquad
+\hat D_{x,t}=E^c_{x,t}\hat m_{x,t}.
+\]
+We use `residuals(fit, scale=FALSE)` and common symmetric colour limits.
+StMoMo internally adds 0.00001 to deaths when calculating its residuals to handle
+possible zeros; the input data used for fitting remain unchanged.
+
+Red denotes observed deaths above the fitted level; blue denotes deaths below it.
+Both magnitude and sign appear on the colour scale. With calendar year horizontal
+and age vertical, observations with a common birth year $c=t-x$ follow an
+**upward-sloping diagonal**, $x=t-c$. Persistent same-sign bands along these paths
+suggest an omitted cohort effect: LC has only an age profile and a common period
+factor, with no separate term for year of birth.
+
+```{r residual-functions}
+LC.res <- lapply(LC.fits, function(f) residuals(f,scale=FALSE)$residuals)
+
+cohort_guides <- function() {
+  for (c in seq(1880,1960,20)) {
+    age <- years.fit-c
+    ok <- age>=min(ages.fit) & age<=max(ages.fit)
+    lines(years.fit[ok], age[ok], col="#555555", lty=3, lwd=.6)
+  }
+}
+plot_residual_pair <- function(mats, titles) {
+  limit <- max(abs(unlist(mats)),na.rm=TRUE)
+  colours <- colorRampPalette(c("#2166AC","white","#B2182B"))(101)
+  par(mfrow=c(1,2),mar=c(4,4,3,6))
+  for (i in seq_along(mats)) {
+    fields::image.plot(years.fit, ages.fit, t(mats[[i]]),
+      zlim=c(-limit,limit), col=colours, useRaster=TRUE,
+      xlab="Calendar year t", ylab="Age x", main=titles[i],
+      legend.lab="", legend.cex=.8, legend.mar=4)
+    cohort_guides(); box()
+  }
+}
+```
+
+```{r lc-residual-maps, fig.width=13, fig.height=6, fig.cap="LC residuals for both countries, using matching scales. Dotted guides follow constant birth cohorts."}
+plot_residual_pair(LC.res,paste(country_names[names(LC.res)],"LC residuals"))
+```
+
+Because larger populations can have larger residual magnitudes, the following
+sign-only maps provide an additional check on the *coherence* of the diagonal
+patterns, rather than identifying the country solely from residual size.
+
+```{r lc-sign-maps, fig.cap="Signs of LC residuals. Blue: observed below fitted; red: observed above fitted; white: zero."}
+plot_sign_pair <- function(mats,titles) {
+  par(mfrow=c(1,2),mar=c(4,4,3,1),oma=c(2,0,0,0))
+  for(i in seq_along(mats)) {
+    image(years.fit,ages.fit,t(sign(mats[[i]])),
+          breaks=c(-1.5,-.5,.5,1.5),col=c("#2166AC","white","#B2182B"),
+          xlab="Calendar year t",ylab="Age x",main=titles[i],useRaster=TRUE)
+    cohort_guides();box()
+  }
+  mtext("Blue = negative; white = zero; red = positive. Dotted guides = constant birth cohorts.",
+        side=1,outer=TRUE,cex=.8)
+}
+plot_sign_pair(LC.res,paste(country_names[names(LC.res)],"LC residual signs"))
+```
+
+### Data-driven comparison of the diagonal patterns
+
+To make the choice for part (b) reproducible rather than hard-coding a country,
+we also summarise the sign coherence along each actual cohort diagonal. Let
+$s_{x,t}=\operatorname{sign}(r_{x,t})$ and let $\bar s_c$ be its mean on cohort $c$.
+The descriptive score is
+\[
+C=\frac{1}{N}\sum_c n_c\bar s_c^2.
+\]
+It is larger when residual signs agree more strongly along cohorts. All fitted
+cells are retained, and both populations have the same grid. This is **not a
+hypothesis test, a new fitting objective or proof of causality**; the residual
+maps remain the principal visual evidence. Unlike total deviance, this summary
+does not automatically increase with the magnitude of exposure.
+
+```{r cohort-evidence}
+cohort_sign_score <- function(mat) {
+  cohort <- as.vector(outer(ages.fit,years.fit,function(x,t)t-x))
+  groups <- split(as.vector(sign(mat)),cohort)
+  n <- lengths(groups)
+  means <- vapply(groups,mean,numeric(1))
+  sum(n*means^2)/sum(n)
+}
+scores <- vapply(LC.res,cohort_sign_score,numeric(1))
+if (abs(diff(scores))<1e-8) stop("Cohort sign scores tie; inspect the maps before selecting part (b).")
+selected_country <- names(which.max(scores))
+selected_name <- unname(country_names[selected_country])
+other_country <- setdiff(names(scores),selected_country)
+knitr::kable(data.frame(Country=country_names[names(scores)],
+                       Cohort_sign_coherence=as.numeric(scores)),digits=4,
+             caption="Descriptive sign coherence along birth-cohort diagonals")
+```
+
+For these supplied data, **`r selected_name`** has the higher diagonal sign-coherence
+score (`r fmt(scores[selected_country],4)` versus
+`r fmt(scores[other_country],4)` for `r country_names[other_country]`).
+The generated maps show more persistent same-sign diagonal bands in this population,
+whereas the other population's pattern is more fragmented. The evidence therefore
+points to **`r selected_name`** as having the stronger omitted cohort structure.
+This does not imply that cohort structure is completely absent in the other
+population, or that every diagonal feature has a known causal explanation.
+
+# Q3(b): Adding a cohort effect
+
+For the population identified above, we retain the teacher's Renshaw–Haberman model:
+\[
+\log m_{x,t}=a_x+b_xk_t+c_xh_{t-x}.
+\]
+Here $h_{t-x}$ is the birth-cohort factor and $c_x$ its age sensitivity.
+This is the age-modulated cohort extension in the supplied R example, not an
+unrelated APC model. The same deaths, exposures and full fitting window are used.
+`approxConst=TRUE` and the package's identifiability constraints follow the teacher's
+implementation. No forecasts are needed for this question.
+
+```{r fit-rh}
+RH <- rh(link="log",cohortAgeFun="NP",approxConst=TRUE)
+z <- populations[[selected_country]]
+RH.fit <- fit(RH,Dxt=z$Dxt,Ext=z$Ext,ages=ages.fit,years=years.fit,verbose=FALSE)
+if (!isTRUE(RH.fit$conv)) stop("RH did not converge: do not report its fit as completed.")
+RH.res <- residuals(RH.fit,scale=FALSE)$residuals
+stopifnot(identical(dim(RH.res),dim(LC.res[[selected_country]])))
+```
+
+```{r rh-residual-maps, fig.width=13, fig.height=6, fig.cap="Before and after adding the cohort term: identical residual definition, age/year axes and colour limits."}
+plot_residual_pair(list(LC.res[[selected_country]],RH.res),
+                   paste(selected_name,c("LC residuals","RH residuals")))
+```
+
+```{r rh-sign-maps, fig.cap="Residual signs for the selected population before and after the RH cohort term."}
+plot_sign_pair(list(LC.res[[selected_country]],RH.res),
+               paste(selected_name,c("LC residual signs","RH residual signs")))
+```
+
+```{r rh-results}
+chosen_LC <- LC.fits[[selected_country]]
+comparison <- data.frame(Model=c("LC","RH"),
+  Converged=c(chosen_LC$conv,RH.fit$conv),
+  Cells=c(chosen_LC$nobs,RH.fit$nobs),
+  Parameters=c(chosen_LC$npar,RH.fit$npar),
+  Poisson_deviance=c(chosen_LC$deviance,RH.fit$deviance),
+  Log_rate_RMSE=c(
+    sqrt(mean((log(z$Dxt/z$Ext)-log(fitted(chosen_LC,type="rates")))^2)),
+    sqrt(mean((log(z$Dxt/z$Ext)-log(fitted(RH.fit,type="rates")))^2))),
+  Cohort_sign_coherence=c(scores[selected_country],cohort_sign_score(RH.res)))
+knitr::kable(comparison,digits=6,caption=paste(selected_name,"LC/RH diagnostics"))
+reduction <- 100*(1-RH.fit$deviance/chosen_LC$deviance)
+coherence_reduced <- cohort_sign_score(RH.res)<scores[selected_country]
+```
+
+The `r selected_name` Poisson deviance changes from
+**`r fmt(chosen_LC$deviance)`** under LC to **`r fmt(RH.fit$deviance)`** under RH,
+a reduction of **`r fmt(reduction,1)`%**. The cohort sign-coherence score
+`r if(coherence_reduced) "also decreases" else "does not decrease"`.
+For the supplied data, the before/after maps show
+`r if(coherence_reduced) "weaker, less persistent same-sign cohort strips and a more mixed residual pattern after including the cohort term" else "remaining structured cohort residuals, so an improved numerical fit alone would be insufficient to claim the cohort pattern was removed"`.
+
+RH can improve this feature because people born in the same year share the factor
+$h_{t-x}$ across different ages and calendar years. LC's single period factor does
+not explicitly allow this birth-year structure. The extra term addresses the
+specific diagonal pattern identified in part (a). Nevertheless, residual structure
+is not necessarily eliminated. RH has more parameters, so the deviance reduction
+is descriptive in-sample evidence, **not a formal chi-square likelihood-ratio test
+or a claim of superior future forecasts**. Cohorts at the boundaries have fewer
+observations and their parameters should be interpreted cautiously.
+
+# Reproducibility
+
+The model specifications follow the supplied `LC_APC.R`; parameter interpretation
+and the RH extension follow the Unit 4 LC/cohort sections. Figures and tables in
+this document are generated from the four raw files during this Knit. LC and RH
+must converge for the document to complete. The following records the actual R
+and package versions used.
+
+```{r session-info}
+sessionInfo()
+```
